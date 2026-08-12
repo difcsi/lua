@@ -368,6 +368,9 @@ typedef struct global_State {
   TString *strcache[STRCACHE_N][STRCACHE_M];  /* cache for strings in API */
   lua_WarnFunction warnf;  /* warning function */
   void *ud_warn;         /* auxiliary data to 'warnf' */
+#if defined(LUA_USE_LIBALLOCS)
+  struct AllocsState *allocs;  /* liballocs integration state (lazy) */
+#endif
   LX mainth;  /* main thread of this state */
 } global_State;
 
@@ -400,6 +403,9 @@ union GCUnion {
   struct Proto p;
   struct lua_State th;  /* thread */
   struct UpVal upv;
+#if defined(LUA_USE_LIBALLOCS)
+  struct Foreign frn;
+#endif
 };
 
 
@@ -422,6 +428,9 @@ union GCUnion {
 #define gco2p(o)	gco2(LUA_VPROTO, Proto, o)
 #define gco2th(o)	gco2(LUA_VTHREAD, lua_State, o)
 #define gco2upv(o)	gco2(LUA_VUPVAL, UpVal, o)
+#if defined(LUA_USE_LIBALLOCS)
+#define gco2frn(o)	gco2nv(LUA_TFOREIGN, Foreign, o)
+#endif
 
 
 /*

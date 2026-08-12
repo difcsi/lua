@@ -79,6 +79,22 @@ MYCFLAGS= $(LOCAL) -std=c99 -DLUA_USE_LINUX
 MYLDFLAGS= -Wl,-E
 MYLIBS= -ldl
 
+# liballocs configuration: build the interpreter with native support for
+# liballocs-typed C objects (first-class LUA_TFOREIGN values).
+#   make LIBALLOCS_CONFIG=1 LIBALLOCS_HOME=... [STACKSCAN_HOME=...] \
+#        [BASETYPES_PROVIDER=.../libbasetypes_provider.so] [TESTS=...]
+# The default build (no LIBALLOCS_CONFIG) is pristine upstream Lua.
+ifdef LIBALLOCS_CONFIG
+MYCFLAGS+= -DLUA_USE_LIBALLOCS -DLIFETIME_POLICIES \
+	-I$(LIBALLOCS_HOME)/include
+ifdef STACKSCAN_HOME
+MYCFLAGS+= -DLUA_ALLOCS_HAVE_STACKSCAN -I$(STACKSCAN_HOME)/include
+endif
+MYLIBS+= -lffi -lpthread \
+	$(LIBALLOCS_HOME)/lib/liballocs_dummyweaks.so \
+	$(BASETYPES_PROVIDER)
+endif
+
 
 CC= gcc
 # (Optionally we can use -march=native -mno-avx512f.)
@@ -97,10 +113,10 @@ LIBS = -lm
 CORE_T=	liblua.a
 CORE_O=	lapi.o lcode.o lctype.o ldebug.o ldo.o ldump.o lfunc.o lgc.o llex.o \
 	lmem.o lobject.o lopcodes.o lparser.o lstate.o lstring.o ltable.o \
-	ltm.o lundump.o lvm.o lzio.o ltests.o
+	ltm.o lundump.o lvm.o lzio.o ltests.o lallocs.o lallocsffi.o
 AUX_O=	lauxlib.o
 LIB_O=	lbaselib.o ldblib.o liolib.o lmathlib.o loslib.o ltablib.o lstrlib.o \
-	lutf8lib.o loadlib.o lcorolib.o linit.o
+	lutf8lib.o loadlib.o lcorolib.o lallocslib.o linit.o
 
 LUA_T=	lua
 LUA_O=	lua.o
@@ -147,6 +163,13 @@ $(ALL_O): makefile ltests.h
 # DO NOT EDIT
 # automatically made with 'gcc -MM l*.c'
 
+lallocs.o: lallocs.c lprefix.h lua.h luaconf.h lallocs.h llimits.h \
+ lstate.h lobject.h ltm.h lzio.h lmem.h ldebug.h ldo.h lgc.h lstring.h \
+ ltable.h
+lallocsffi.o: lallocsffi.c lprefix.h lua.h luaconf.h lallocs.h llimits.h \
+ lstate.h lobject.h ltm.h lzio.h lmem.h ldebug.h ldo.h lgc.h lstring.h
+lallocslib.o: lallocslib.c lprefix.h lua.h luaconf.h lallocs.h lauxlib.h \
+ lualib.h llimits.h
 lapi.o: lapi.c lprefix.h lua.h luaconf.h lapi.h llimits.h lstate.h \
  lobject.h ltm.h lzio.h lmem.h ldebug.h ldo.h lfunc.h lgc.h lstring.h \
  ltable.h lundump.h lvm.h

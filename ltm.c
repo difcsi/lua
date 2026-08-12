@@ -24,6 +24,10 @@
 #include "ltm.h"
 #include "lvm.h"
 
+#if defined(LUA_USE_LIBALLOCS)
+#include "lallocs.h"
+#endif
+
 
 static const char udatatypename[] = "userdata";
 
@@ -31,6 +35,9 @@ LUAI_DDEF const char *const luaT_typenames_[LUA_TOTALTYPES] = {
   "no value",
   "nil", "boolean", udatatypename, "number",
   "string", "table", "function", udatatypename, "thread",
+#if defined(LUA_USE_LIBALLOCS)
+  "foreign",
+#endif
   "upvalue", "proto" /* these last cases are used for tests only */
 };
 
@@ -96,6 +103,13 @@ const char *luaT_objtypename (lua_State *L, const TValue *o) {
     if (ttisstring(name))  /* is '__name' a string? */
       return getstr(tsvalue(name));  /* use it as type name */
   }
+#if defined(LUA_USE_LIBALLOCS)
+  if (ttisforeign(o)) {
+    const char *tn = luaA_foreigntypename(L, frnvalue(o));
+    if (tn != NULL)
+      return tn;  /* use the C type's name */
+  }
+#endif
   return ttypename(ttype(o));  /* else use standard type name */
 }
 

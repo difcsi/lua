@@ -359,6 +359,12 @@ void lua_printvalue (TValue *v) {
       printf("thread: %p", thvalue(v)); break;
     case LUA_VTABLE:
       printf("table: %p", hvalue(v)); break;
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFOREIGN:
+      printf("foreign: %p", frnvalue(v)->addr); break;
+    case LUA_VFFUNC:
+      printf("foreign function: %p", frnvalue(v)->addr); break;
+#endif
     default:
       lua_assert(0);
   }
@@ -537,6 +543,12 @@ static void checkrefs (global_State *g, GCObject *o) {
       assert(!isgray(o));  /* strings are never gray */
       break;
     }
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFOREIGN: case LUA_VFFUNC: {
+      checkobjrefN(g, o, gco2frn(o)->base);
+      break;
+    }
+#endif
     default: assert(0);
   }
 }
@@ -568,6 +580,9 @@ static void checkobject (global_State *g, GCObject *o, int maybedead,
         getage(o) == G_TOUCHED1 ||
         getage(o) == G_OLD0 ||
         o->tt == LUA_VTHREAD ||
+#if defined(LUA_USE_LIBALLOCS)
+        novariant(o->tt) == LUA_TFOREIGN ||  /* kept gray, like threads */
+#endif
         (o->tt == LUA_VUPVAL && upisopen(gco2upv(o))));
       }
       assert(getage(o) != G_TOUCHED1 || isgray(o));
@@ -596,6 +611,9 @@ static l_mem checkgraylist (global_State *g, GCObject *o) {
         assert(gco2u(o)->nuvalue > 0);
         o = gco2u(o)->gclist;
         break;
+#if defined(LUA_USE_LIBALLOCS)
+      case LUA_VFOREIGN: case LUA_VFFUNC: o = gco2frn(o)->gclist; break;
+#endif
       default: assert(0);  /* other objects cannot be in a gray list */
     }
   }

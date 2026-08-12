@@ -531,6 +531,53 @@ typedef struct Udata0 {
 /* }================================================================== */
 
 
+#if defined(LUA_USE_LIBALLOCS)
+/*
+** {==================================================================
+** Foreign values (liballocs-typed C objects)
+** ===================================================================
+*/
+
+#define LUA_VFOREIGN	makevariant(LUA_TFOREIGN, 0)  /* data object/view */
+#define LUA_VFFUNC	makevariant(LUA_TFOREIGN, 1)  /* callable C function */
+
+#define ttisforeign(o)		checktype((o), LUA_TFOREIGN)
+#define ttisforeigndata(o)	checktag((o), ctb(LUA_VFOREIGN))
+#define ttisforeignfunc(o)	checktag((o), ctb(LUA_VFFUNC))
+
+struct uniqtype;       /* liballocs type descriptor (opaque here) */
+struct ForeignType;    /* marshalling entry, defined in lallocs.h */
+
+/* flags */
+#define FF_BASE		1  /* covers a whole allocation; owns the policy
+                              attach (or handle refcount) for its chunk */
+#define FF_HANDLE	2  /* 'addr' is an indirection handle, not a
+                              direct address */
+
+typedef struct Foreign {
+  CommonHeader;  /* tt is LUA_VFOREIGN or LUA_VFFUNC */
+  lu_byte flags;
+  void *addr;  /* addresslike; for FF_BASE, the allocation start */
+  const struct uniqtype *type;  /* object type; subprogram for VFFUNC */
+  size_t length;  /* element count for arrays/views; 0 if unknown */
+  struct Foreign *base;  /* interior views: base anchor (GC edge) */
+  struct ForeignType *ftype;  /* cached marshalling entry (per state) */
+  GCObject *gclist;
+} Foreign;
+
+#define frnvalue(o)	check_exp(ttisforeign(o), gco2frn(val_(o).gc))
+
+#define setfrnvalue(L,obj,x) \
+  { TValue *io = (obj); Foreign *x_ = (x); \
+    val_(io).gc = obj2gco(x_); settt_(io, ctb(x_->tt)); \
+    checkliveness(L,io); }
+
+#define setfrnvalue2s(L,o,f)	setfrnvalue(L,s2v(o),f)
+
+/* }================================================================== */
+#endif
+
+
 /*
 ** {==================================================================
 ** Prototypes

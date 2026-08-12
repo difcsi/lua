@@ -25,6 +25,10 @@
 #include "ltable.h"
 #include "ltm.h"
 
+#if defined(LUA_USE_LIBALLOCS)
+#include "lallocs.h"
+#endif
+
 
 /*
 ** Maximum number of elements to sweep in each single step.
@@ -154,6 +158,12 @@ static l_mem objsize (GCObject *o) {
       res = sizeof(UpVal);
       break;
     }
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFOREIGN: case LUA_VFFUNC: {
+      res = sizeof(Foreign);
+      break;
+    }
+#endif
     default: res = 0; lua_assert(0);
   }
   return cast(l_mem, res);
@@ -172,6 +182,9 @@ static GCObject **getgclist (GCObject *o) {
       lua_assert(u->nuvalue > 0);
       return &u->gclist;
     }
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFOREIGN: case LUA_VFFUNC: return &gco2frn(o)->gclist;
+#endif
     default: lua_assert(0); return 0;
   }
 }
@@ -367,9 +380,27 @@ static void reallymarkobject (global_State *g, GCObject *o) {
       linkobjgclist(o, g->gray);  /* to be visited later */
       break;
     }
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFOREIGN: case LUA_VFFUNC: {
+      linkobjgclist(o, g->gray);  /* to be visited later */
+      break;
+    }
+#endif
     default: lua_assert(0); break;
   }
 }
+
+
+#if defined(LUA_USE_LIBALLOCS)
+/*
+** Marking entry point for the foreign-object traversal in lallocs.c
+** ('reallymarkobject' is private to this file).
+*/
+void luaA_markgcobject (global_State *g, GCObject *o) {
+  if (iswhite(o))
+    reallymarkobject(g, o);
+}
+#endif
 
 
 /*
@@ -735,6 +766,10 @@ static l_mem propagatemark (global_State *g) {
     case LUA_VCCL: return traverseCclosure(g, gco2ccl(o));
     case LUA_VPROTO: return traverseproto(g, gco2p(o));
     case LUA_VTHREAD: return traversethread(g, gco2th(o));
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFOREIGN: case LUA_VFFUNC:
+      return luaA_traverseforeign(g, gco2frn(o));
+#endif
     default: lua_assert(0); return 0;
   }
 }
@@ -876,6 +911,11 @@ static void freeobj (lua_State *L, GCObject *o) {
       luaM_freemem(L, ts, luaS_sizelngstr(ts->u.lnglen, ts->shrlen));
       break;
     }
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFOREIGN: case LUA_VFFUNC:
+      luaA_freeforeign(L, gco2frn(o));
+      break;
+#endif
     default: lua_assert(0);
   }
   lua_assert(gettotalbytes(G(L)) == newmem);

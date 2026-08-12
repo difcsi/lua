@@ -71,7 +71,12 @@ typedef struct lua_State lua_State;
 #define LUA_TUSERDATA		7
 #define LUA_TTHREAD		8
 
+#if defined(LUA_USE_LIBALLOCS)
+#define LUA_TFOREIGN		9
+#define LUA_NUMTYPES		10
+#else
 #define LUA_NUMTYPES		9
+#endif
 
 
 

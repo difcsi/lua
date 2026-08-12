@@ -27,6 +27,10 @@
 #include "ltable.h"
 #include "ltm.h"
 
+#if defined(LUA_USE_LIBALLOCS)
+#include "lallocs.h"
+#endif
+
 
 
 #define fromstate(L)	(cast(LX *, cast(lu_byte *, (L)) - offsetof(LX, l)))
@@ -268,6 +272,9 @@ static void close_state (lua_State *L) {
     luaC_freeallobjects(L);  /* collect all objects */
     luai_userstateclose(L);
   }
+#if defined(LUA_USE_LIBALLOCS)
+  luaA_close(L);  /* after 'luaC_freeallobjects': all Foreigns are gone */
+#endif
   luaM_freearray(L, G(L)->strt.hash, cast_sizet(G(L)->strt.size));
   freestack(L);
   lua_assert(gettotalbytes(g) == sizeof(global_State));
@@ -384,6 +391,9 @@ LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud, unsigned seed) {
   setgcparam(g, MINORMAJOR, LUAI_MINORMAJOR);
   setgcparam(g, MAJORMINOR, LUAI_MAJORMINOR);
   for (i=0; i < LUA_NUMTYPES; i++) g->mt[i] = NULL;
+#if defined(LUA_USE_LIBALLOCS)
+  g->allocs = NULL;  /* created lazily on first foreign value */
+#endif
   if (luaD_rawrunprotected(L, f_luaopen, NULL) != LUA_OK) {
     /* memory allocation error: free partial state */
     close_state(L);
