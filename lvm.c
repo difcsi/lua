@@ -31,6 +31,10 @@
 #include "ltm.h"
 #include "lvm.h"
 
+#if defined(LUA_USE_LIBALLOCS)
+#include "lallocs.h"
+#endif
+
 
 /*
 ** By default, use jump tables in the main interpreter loop on gcc
@@ -295,6 +299,13 @@ lu_byte luaV_finishget (lua_State *L, const TValue *t, TValue *key,
   for (loop = 0; loop < MAXTAGLOOP; loop++) {
     if (tag == LUA_VNOTABLE) {  /* 't' is not a table? */
       lua_assert(!ttistable(t));
+#if defined(LUA_USE_LIBALLOCS)
+      if (ttisforeign(t)) {  /* native field/element access */
+        int fr = luaA_foreignget(L, t, key, val);
+        if (fr != LUAA_NOTFOUND)
+          return cast_byte(fr);
+      }  /* else fall through to __index (methods, error messages) */
+#endif
       tm = luaT_gettmbyobj(L, t, TM_INDEX);
       if (l_unlikely(notm(tm)))
         luaG_typeerror(L, t, "index");  /* no metamethod */
@@ -351,6 +362,12 @@ void luaV_finishset (lua_State *L, const TValue *t, TValue *key,
       /* else will try the metamethod */
     }
     else {  /* not a table; check metamethod */
+#if defined(LUA_USE_LIBALLOCS)
+      if (ttisforeign(t)  /* native field/element store */
+          && luaA_foreignset(L, t, key, val) != LUAA_NOTFOUND)
+        return;
+      /* else fall through to __newindex (parity error messages) */
+#endif
       tm = luaT_gettmbyobj(L, t, TM_NEWINDEX);
       if (l_unlikely(notm(tm)))
         luaG_typeerror(L, t, "index");
@@ -752,6 +769,17 @@ void luaV_objlen (lua_State *L, StkId ra, const TValue *rb) {
       setivalue(s2v(ra), cast_st2S(tsvalue(rb)->u.lnglen));
       return;
     }
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFOREIGN: {
+      lua_Integer len;
+      if (luaA_foreignlen(L, rb, &len)) {
+        setivalue(s2v(ra), len);
+        return;
+      }
+      goto foreigntm;  /* other foreign kinds: try metamethod */
+    }
+    foreigntm:
+#endif
     default: {  /* try metamethod */
       tm = luaT_gettmbyobj(L, rb, TM_LEN);
       if (l_unlikely(notm(tm)))  /* no metamethod? */

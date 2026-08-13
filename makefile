@@ -86,13 +86,25 @@ MYLIBS= -ldl
 # The default build (no LIBALLOCS_CONFIG) is pristine upstream Lua.
 ifdef LIBALLOCS_CONFIG
 MYCFLAGS+= -DLUA_USE_LIBALLOCS -DLIFETIME_POLICIES \
-	-I$(LIBALLOCS_HOME)/include
+	-I$(LIBALLOCS_HOME)/include \
+	-I$(LIBALLOCS_HOME)/contrib/libsystrap/contrib/librunt/include \
+	-I$(LIBALLOCS_HOME)/contrib/liballocstool/include
 ifdef STACKSCAN_HOME
 MYCFLAGS+= -DLUA_ALLOCS_HAVE_STACKSCAN -I$(STACKSCAN_HOME)/include
 endif
+# LIBALLOCS_LINK=dummyweaks links only the no-op stubs: the foreign
+# machinery is compiled in but inert (used to run the upstream test
+# suite without the liballocs runtime in the process). The default
+# links the full runtime plus the base-types provider.
+ifeq ($(LIBALLOCS_LINK),dummyweaks)
 MYLIBS+= -lffi -lpthread \
+	$(LIBALLOCS_HOME)/lib/liballocs_dummyweaks.so
+else
+MYLIBS+= -lffi -lpthread \
+	$(LIBALLOCS_HOME)/lib/liballocs_preload.so \
 	$(LIBALLOCS_HOME)/lib/liballocs_dummyweaks.so \
 	$(BASETYPES_PROVIDER)
+endif
 endif
 
 
@@ -113,7 +125,8 @@ LIBS = -lm
 CORE_T=	liblua.a
 CORE_O=	lapi.o lcode.o lctype.o ldebug.o ldo.o ldump.o lfunc.o lgc.o llex.o \
 	lmem.o lobject.o lopcodes.o lparser.o lstate.o lstring.o ltable.o \
-	ltm.o lundump.o lvm.o lzio.o ltests.o lallocs.o lallocsffi.o
+	ltm.o lundump.o lvm.o lzio.o ltests.o lallocs.o lallocsffi.o \
+	lallocsbounds.o
 AUX_O=	lauxlib.o
 LIB_O=	lbaselib.o ldblib.o liolib.o lmathlib.o loslib.o ltablib.o lstrlib.o \
 	lutf8lib.o loadlib.o lcorolib.o lallocslib.o linit.o
@@ -160,16 +173,32 @@ echo:
 
 $(ALL_O): makefile ltests.h
 
+# The lallocs*.c files include liballocs headers, which need GNU C and
+# reference protected data symbols in liballocs DSOs (so they must use
+# GOT indirection: -fPIC); the rest of the tree keeps the stock flags.
+LALLOCS_STD= -std=gnu11 -fPIC
+lallocs.o:
+	$(CC) $(CFLAGS) $(LALLOCS_STD) -c -o $@ lallocs.c
+lallocsffi.o:
+	$(CC) $(CFLAGS) $(LALLOCS_STD) -c -o $@ lallocsffi.c
+lallocsbounds.o:
+	$(CC) $(CFLAGS) $(LALLOCS_STD) -c -o $@ lallocsbounds.c
+lallocslib.o:
+	$(CC) $(CFLAGS) $(LALLOCS_STD) -c -o $@ lallocslib.c
+
 # DO NOT EDIT
 # automatically made with 'gcc -MM l*.c'
 
 lallocs.o: lallocs.c lprefix.h lua.h luaconf.h lallocs.h llimits.h \
- lstate.h lobject.h ltm.h lzio.h lmem.h ldebug.h ldo.h lgc.h lstring.h \
- ltable.h
+ lstate.h lobject.h ltm.h lzio.h lmem.h lapi.h ldebug.h ldo.h lgc.h \
+ lstring.h ltable.h lvm.h
+lallocsbounds.o: lallocsbounds.c lprefix.h lua.h luaconf.h lallocs.h \
+ llimits.h lstate.h lobject.h ltm.h lzio.h lmem.h
 lallocsffi.o: lallocsffi.c lprefix.h lua.h luaconf.h lallocs.h llimits.h \
- lstate.h lobject.h ltm.h lzio.h lmem.h ldebug.h ldo.h lgc.h lstring.h
+ lstate.h lobject.h ltm.h lzio.h lmem.h lapi.h lauxlib.h ldebug.h ldo.h \
+ lgc.h lstring.h
 lallocslib.o: lallocslib.c lprefix.h lua.h luaconf.h lallocs.h lauxlib.h \
- lualib.h llimits.h
+ lualib.h llimits.h lgc.h lobject.h lstate.h ltm.h
 lapi.o: lapi.c lprefix.h lua.h luaconf.h lapi.h llimits.h lstate.h \
  lobject.h ltm.h lzio.h lmem.h ldebug.h ldo.h lfunc.h lgc.h lstring.h \
  ltable.h lundump.h lvm.h

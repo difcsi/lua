@@ -474,6 +474,9 @@ static void restartcollection (global_State *g) {
   markobject(g, mainthread(g));
   markvalue(g, &g->l_registry);
   markmt(g);
+#if defined(LUA_USE_LIBALLOCS)
+  luaA_markroots(g);  /* C slots holding the only reference to a Foreign */
+#endif
   markbeingfnz(g);  /* mark any finalizing object left from previous cycle */
 }
 
@@ -1592,6 +1595,9 @@ static void atomic (lua_State *L) {
   /* registry and global metatables may be changed by API */
   markvalue(g, &g->l_registry);
   markmt(g);  /* mark global metatables */
+#if defined(LUA_USE_LIBALLOCS)
+  luaA_markroots(g);  /* external roots may have appeared mid-cycle */
+#endif
   propagateall(g);  /* empties 'gray' list */
   /* remark occasional upvalues of (maybe) dead threads */
   remarkupvals(g);

@@ -33,6 +33,10 @@
 #include "lvm.h"
 #include "lzio.h"
 
+#if defined(LUA_USE_LIBALLOCS)
+#include "lallocs.h"
+#endif
+
 
 
 #define errorstatus(s)	((s) > LUA_YIELD)
@@ -677,6 +681,10 @@ int luaD_pretailcall (lua_State *L, CallInfo *ci, StkId func,
       return precallC(L, func, status, clCvalue(s2v(func))->f);
     case LUA_VLCF:  /* light C function */
       return precallC(L, func, status, fvalue(s2v(func)));
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFFUNC:  /* foreign function */
+      return precallC(L, func, status, luaA_callforeign);
+#endif
     case LUA_VLCL: {  /* Lua function */
       Proto *p = clLvalue(s2v(func))->p;
       int fsize = p->maxstacksize;  /* frame size */
@@ -725,6 +733,11 @@ CallInfo *luaD_precall (lua_State *L, StkId func, int nresults) {
     case LUA_VLCF:  /* light C function */
       precallC(L, func, status, fvalue(s2v(func)));
       return NULL;
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFFUNC:  /* foreign function */
+      precallC(L, func, status, luaA_callforeign);
+      return NULL;
+#endif
     case LUA_VLCL: {  /* Lua function */
       CallInfo *ci;
       Proto *p = clLvalue(s2v(func))->p;
