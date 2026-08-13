@@ -20,6 +20,7 @@
 #include "lprefix.h"
 
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,11 +101,62 @@ void __notify_ptr_write (const void **dest, const void *val);
 
 LUAI_DDEF Foreign luaA_deadentry_;
 
-/* Single process-wide GC policy and (for now) single served state:
-** policy callbacks carry no context. Multi-state support (a registry
-** of AllocsStates) arrives with milestone M5. */
+/*
+** One process-wide GC policy serves every state: liballocs caps the
+** number of policies far below "one per state", and the callbacks
+** carry no context anyway. They consult a registry of live states
+** (linked through AllocsState.next, guarded by a mutex: instrumented
+** pointer writes can happen on any thread). Chunk lifetime is shared
+** through a process-wide refcount map: the policy attaches when the
+** first state adopts a chunk and detaches when the last one lets go,
+** so two states viewing the same chunk never double-attach and one
+** state's close cannot free memory another still views.
+**
+** Threading caveat (documented in the README): the registry and the
+** refcounts are mutex-guarded, but marking GC objects from a callback
+** is only safe when the write happens on the owning state's thread --
+** the usual arrangement, since the write is made by C code that state
+** called into.
+*/
 static int g_policy_id = -1;
-static AllocsState *g_as = NULL;
+static AllocsState *g_states = NULL;      /* registry head */
+static pthread_mutex_t g_states_mu = PTHREAD_MUTEX_INITIALIZER;
+static AllocsMap g_chunkrefs;             /* alloc start -> refcount */
+static pthread_mutex_t g_chunkrefs_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* take one shared reference on 'addr'; attach the policy on 0 -> 1 */
+static void chunkref_inc (void *addr) {
+  size_t n;
+  pthread_mutex_lock(&g_chunkrefs_mu);
+  n = (size_t)luaA_mapget(&g_chunkrefs, addr);
+  luaA_mapset(NULL, &g_chunkrefs, addr, (void *)(n + 1));
+  pthread_mutex_unlock(&g_chunkrefs_mu);
+  if (n == 0) {
+    if (ss_is_handle(addr))
+      ss_inc_refcount(addr);
+    else
+      __liballocs_attach_lifetime_policy(g_policy_id, ss_translate(addr));
+  }
+}
+
+/* drop one shared reference; detach (possibly freeing) on 1 -> 0 */
+static void chunkref_dec (void *addr) {
+  size_t n;
+  pthread_mutex_lock(&g_chunkrefs_mu);
+  n = (size_t)luaA_mapget(&g_chunkrefs, addr);
+  lua_assert(n > 0);
+  if (n <= 1)
+    luaA_mapremove(&g_chunkrefs, addr);
+  else
+    luaA_mapset(NULL, &g_chunkrefs, addr, (void *)(n - 1));
+  pthread_mutex_unlock(&g_chunkrefs_mu);
+  if (n == 1) {
+    if (ss_is_handle(addr))
+      ss_dec_refcount(addr);
+    else  /* may free the chunk; delref callbacks re-enter natively */
+      __liballocs_detach_lifetime_policy(g_policy_id, ss_translate(addr));
+  }
+}
 
 
 void *luaA_rawaddr (Foreign *f) {
@@ -345,32 +397,36 @@ static int slot_is_lua_known (AllocsState *as, const void **from) {
 }
 
 static void lp_addref (const void *target, const void **from) {
-  AllocsState *as = g_as;
-  Foreign *f;
-  if (as == NULL) return;
-  f = cast(Foreign *, luaA_mapget(&as->basemap, target));
-  if (f == NULL) return;
-  if (slot_is_lua_known(as, from))
-    return;  /* internal edge: the GC traversal covers it */
-  luaA_mapset(NULL, &as->roots, from, f);
-  /* Keep the rooted object safe against an in-progress collection: it
-     may already have been overlooked (root added after 'atomic') or
-     even dead-marked but not yet swept. */
-  {
-    global_State *g = G(as->mainL);
-    GCObject *o = obj2gco(f);
-    if (isdead(g, o))
-      changewhite(o);  /* resurrect: sweep will keep it */
-    else if (keepinvariant(g))
-      luaA_markgcobject(g, o);
+  AllocsState *as;
+  pthread_mutex_lock(&g_states_mu);
+  for (as = g_states; as != NULL; as = as->next) {
+    Foreign *f = cast(Foreign *, luaA_mapget(&as->basemap, target));
+    if (f == NULL) continue;
+    if (slot_is_lua_known(as, from))
+      continue;  /* internal edge: the GC traversal covers it */
+    luaA_mapset(NULL, &as->roots, from, f);
+    /* Keep the rooted object safe against an in-progress collection:
+       it may already have been overlooked (root added after 'atomic')
+       or even dead-marked but not yet swept. */
+    {
+      global_State *g = G(as->mainL);
+      GCObject *o = obj2gco(f);
+      if (isdead(g, o))
+        changewhite(o);  /* resurrect: sweep will keep it */
+      else if (keepinvariant(g))
+        luaA_markgcobject(g, o);
+    }
   }
+  pthread_mutex_unlock(&g_states_mu);
 }
 
 static void lp_delref (const void *target, const void **from) {
-  AllocsState *as = g_as;
+  AllocsState *as;
   (void)target;  /* spurious calls from inexistent locations expected */
-  if (as == NULL) return;
-  luaA_mapremove(&as->roots, from);
+  pthread_mutex_lock(&g_states_mu);
+  for (as = g_states; as != NULL; as = as->next)
+    luaA_mapremove(&as->roots, from);
+  pthread_mutex_unlock(&g_states_mu);
 }
 
 /* mark every rooted Foreign (called from restartcollection/atomic) */
@@ -410,15 +466,10 @@ AllocsState *luaA_getstate (lua_State *L) {
     as->internsize = INTERN_INITSIZE;
     as->mainL = mainthread(g);
     g->allocs = as;
-    if (g_as != NULL && g_as != as) {
-      /* second state in one process: not yet supported (M5) */
-      free(as->intern);
-      free(as);
-      g->allocs = NULL;
-      luaG_runerror(L, "only one lua_State per process may use liballocs"
-                       " foreign objects (for now)");
-    }
-    g_as = as;
+    pthread_mutex_lock(&g_states_mu);
+    as->next = g_states;  /* enter the process registry */
+    g_states = as;
+    pthread_mutex_unlock(&g_states_mu);
     if (g_policy_id < 0 && allocs_runtime_present())
       g_policy_id = __liballocs_register_gc_policy(lp_addref, lp_delref);
   }
@@ -430,8 +481,15 @@ void luaA_close (lua_State *L) {
   global_State *g = G(L);
   AllocsState *as = g->allocs;
   if (as != NULL) {
-    if (g_as == as)
-      g_as = NULL;  /* callbacks must no-op from here on */
+    AllocsState **p;
+    pthread_mutex_lock(&g_states_mu);
+    for (p = &g_states; *p != NULL; p = &(*p)->next) {
+      if (*p == as) {  /* leave the registry: callbacks must not see us */
+        *p = as->next;
+        break;
+      }
+    }
+    pthread_mutex_unlock(&g_states_mu);
     lua_assert(as->internlive == 0);  /* all Foreigns already freed */
     free(as->intern);
     mapfree(&as->typemap);
@@ -574,12 +632,8 @@ void luaA_freeforeign (lua_State *L, Foreign *f) {
     if (cast(Foreign *, luaA_mapget(&as->basemap, f->addr)) == f)
       luaA_mapremove(&as->basemap, f->addr);
   }
-  if ((f->flags & FF_BASE) && !(f->flags & FF_RELEASED)) {
-    if (ss_is_handle(f->addr))
-      ss_dec_refcount(f->addr);
-    else  /* may free the chunk; delref callbacks re-enter natively */
-      __liballocs_detach_lifetime_policy(g_policy_id, ss_translate(f->addr));
-  }
+  if ((f->flags & FF_BASE) && !(f->flags & FF_RELEASED))
+    chunkref_dec(f->addr);
   if (f->flags & FF_CLOSURE)
     luaA_freeclosure(as, f);
   {
@@ -1898,10 +1952,7 @@ Foreign *luaA_getorcreatebase (lua_State *L, void *addr) {
                       (ft->ft_kind == SUBPROGRAM) ? LUA_VFFUNC : LUA_VFOREIGN);
   if (!(f->flags & FF_BASE)) {
     f->flags |= FF_BASE;
-    if (ss_is_handle(base_addr))
-      ss_inc_refcount(base_addr);
-    else
-      __liballocs_attach_lifetime_policy(g_policy_id, ss_translate(base_addr));
+    chunkref_inc(base_addr);
     luaA_mapset(L, &as->basemap, base_addr, f);
     purge_roots_in(as, cast(const char *, base_addr), (size_t)alloc_size);
     /* make the GC pacer see the adopted C memory (the debt resets at
@@ -1974,10 +2025,7 @@ void luaA_release (lua_State *L, Foreign *f) {
 
   if (f->flags & FF_BASE) {
     luaA_mapremove(&as->basemap, f->addr);
-    if (ss_is_handle(f->addr))
-      ss_dec_refcount(f->addr);
-    else
-      __liballocs_detach_lifetime_policy(g_policy_id, ss_translate(f->addr));
+    chunkref_dec(f->addr);
   }
   /* drop the intern entry so a fresh Foreign can emerge for this
      address if it is re-typed later */

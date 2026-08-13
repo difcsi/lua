@@ -1000,8 +1000,8 @@ static void add_type_field (lua_State *L, const char *name,
 }
 
 LUAMOD_API int luaopen_allocs (lua_State *L) {
-  luaA_getstate(L);  /* create state, register the GC policy, and
-                        enforce the one-state-per-process limit */
+  luaA_getstate(L);  /* create the per-state integration state, enter
+                        the process registry, register the GC policy */
   inittypemeta(L);
   installforeignmt(L);
 

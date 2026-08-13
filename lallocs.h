@@ -148,6 +148,7 @@ typedef struct AllocsMap {
 */
 typedef struct AllocsState {
   lua_State *mainL;           /* the state's main thread */
+  struct AllocsState *next;   /* process registry link (lallocs.c) */
   AllocsInternEntry *intern;  /* (addr,ftype,length) -> live Foreign */
   size_t internsize;  /* capacity, always a power of 2 */
   size_t internuse;   /* live entries + tombstones */
