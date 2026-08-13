@@ -326,12 +326,32 @@ Foreign *luaA_internlookup (AllocsState *as, void *addr,
 ** arrives with milestone M3. Callbacks touch only native structures.
 */
 
+/* does this C slot lie inside an allocation that Lua already views
+** (i.e. one with a base Foreign)? Such slots are internal edges: the
+** traversal discovers them, and rooting them is precisely the
+** SLOT_REFS cycle leak. */
+static int slot_is_lua_known (AllocsState *as, const void **from) {
+  struct allocator *a = NULL;
+  const void *alloc_start = NULL;
+  struct liballocs_err *err;
+  if (luaA_mapget(&as->basemap, from) != NULL)
+    return 1;  /* slot at the very start of a known chunk */
+  if (!allocs_runtime_present())
+    return 0;
+  err = __liballocs_get_alloc_info(from, &a, &alloc_start, NULL, NULL, NULL);
+  if (err || alloc_start == NULL)
+    return 0;
+  return luaA_mapget(&as->basemap, alloc_start) != NULL;
+}
+
 static void lp_addref (const void *target, const void **from) {
   AllocsState *as = g_as;
   Foreign *f;
   if (as == NULL) return;
   f = cast(Foreign *, luaA_mapget(&as->basemap, target));
   if (f == NULL) return;
+  if (slot_is_lua_known(as, from))
+    return;  /* internal edge: the GC traversal covers it */
   luaA_mapset(NULL, &as->roots, from, f);
   /* Keep the rooted object safe against an in-progress collection: it
      may already have been overlooked (root added after 'atomic') or
@@ -476,12 +496,74 @@ Foreign *luaA_toforeign (lua_State *L, int idx) {
 }
 
 
+/* mark the base Foreign viewing the allocation 'target' points into
+** (exact basemap hit for base pointers, else resolve the allocation
+** start); interior pointers to unknown chunks are invisible edges */
+static l_mem marktarget (global_State *g, AllocsState *as, void *target) {
+  Foreign *tf = cast(Foreign *, luaA_mapget(&as->basemap, target));
+  if (tf == NULL && allocs_runtime_present()) {
+    struct allocator *a = NULL;
+    const void *alloc_start = NULL;
+    struct liballocs_err *err =
+        __liballocs_get_alloc_info(target, &a, &alloc_start, NULL, NULL,
+                                   NULL);
+    if (!err && alloc_start != NULL)
+      tf = cast(Foreign *, luaA_mapget(&as->basemap, alloc_start));
+  }
+  if (tf != NULL)
+    luaA_markgcobject(g, obj2gco(tf));
+  return 1;
+}
+
+/*
+** Walk the pointer slots of a C region via its uniqtype layout,
+** marking the base Foreigns of pointed-to allocations: C->C edges
+** become ordinary GC edges, which is what makes host<->C reference
+** cycles collectable. 'nelems_hint' bounds arrays whose static type
+** has no known length (flexible arrays: the view's element count).
+*/
+static l_mem traverse_region (global_State *g, AllocsState *as,
+                              char *region, const struct uniqtype *t,
+                              size_t nelems_hint) {
+  l_mem work = 0;
+  if (t == NULL) return 0;
+  if (UNIQTYPE_IS_POINTER_TYPE(t)) {
+    void *target = *(void **)region;
+    if (target != NULL)
+      work += marktarget(g, as, target);
+  }
+  else if (UNIQTYPE_IS_ARRAY_TYPE(t)) {
+    const struct uniqtype *et = UNIQTYPE_ARRAY_ELEMENT_TYPE(t);
+    size_t esz, n, i;
+    if (et == NULL) return 0;
+    esz = UNIQTYPE_SIZE_IN_BYTES(et);
+    if (esz == 0) return 0;
+    n = UNIQTYPE_HAS_KNOWN_LENGTH(t) ? UNIQTYPE_ARRAY_LENGTH(t)
+                                     : nelems_hint;
+    for (i = 0; i < n; i++)
+      work += traverse_region(g, as, region + i * esz, et, 0);
+  }
+  else if (UNIQTYPE_IS_COMPOSITE_TYPE(t)) {
+    unsigned nmemb = UNIQTYPE_COMPOSITE_MEMBER_COUNT(t);
+    unsigned i;
+    for (i = 0; i < nmemb; i++)
+      work += traverse_region(g, as, region + t->related[i].un.memb.off,
+                              t->related[i].un.memb.ptr, 0);
+  }
+  return work;
+}
+
 l_mem luaA_traverseforeign (global_State *g, Foreign *f) {
+  l_mem work = 1;
   if (f->base != NULL)
     luaA_markgcobject(g, obj2gco(f->base));
   if (f->flags & FF_CLOSURE)
     luaA_traverseclosure(g, f);
-  return 1;
+  if ((f->flags & FF_BASE) && !(f->flags & FF_RELEASED)
+      && f->ftype != NULL && g->allocs != NULL)
+    work += traverse_region(g, g->allocs, cast(char *, luaA_rawaddr(f)),
+                            f->ftype->ft_type, f->length);
+  return work;
 }
 
 
@@ -1750,10 +1832,34 @@ ForeignType *luaA_gettype (lua_State *L, const struct uniqtype *type) {
 ** ===================================================================
 */
 
+/*
+** When a chunk first becomes Lua-known, drop any external-root
+** entries whose slot lies inside it: they were classified "external"
+** before the chunk had a base Foreign, and leaving them would pin
+** cycles (their edges are now discovered by the traversal instead).
+*/
+static void purge_roots_in (AllocsState *as, const char *start,
+                            size_t size) {
+  size_t i;
+  if (size == 0 || as->roots.size == 0) return;
+  for (i = 0; i < as->roots.size; i++) {
+    AllocsMapEntry *e = &as->roots.tab[i];
+    if (e->key != NULL && e->key != LUAA_DEADKEY) {
+      const char *k = cast(const char *, e->key);
+      if (k >= start && k < start + size) {
+        e->key = LUAA_DEADKEY;
+        e->val = NULL;
+        as->roots.live--;
+      }
+    }
+  }
+}
+
 Foreign *luaA_getorcreatebase (lua_State *L, void *addr) {
   AllocsState *as = luaA_getstate(L);
   struct allocator *allocator = NULL;
   const void *alloc_start = NULL;
+  unsigned long alloc_size = 0;
   struct uniqtype *alloc_type = NULL;
   void *raw = ss_translate(addr);
   void *base_addr;
@@ -1768,8 +1874,8 @@ Foreign *luaA_getorcreatebase (lua_State *L, void *addr) {
     return f;
   }
 
-  err = __liballocs_get_alloc_info(raw, &allocator, &alloc_start, NULL,
-                                   &alloc_type, NULL);
+  err = __liballocs_get_alloc_info(raw, &allocator, &alloc_start,
+                                   &alloc_size, &alloc_type, NULL);
   if (err || !allocator || !ALLOCATOR_HANDLE_LIFETIME_INSERT(allocator)
       || !alloc_type)
     return NULL;
@@ -1797,6 +1903,11 @@ Foreign *luaA_getorcreatebase (lua_State *L, void *addr) {
     else
       __liballocs_attach_lifetime_policy(g_policy_id, ss_translate(base_addr));
     luaA_mapset(L, &as->basemap, base_addr, f);
+    purge_roots_in(as, cast(const char *, base_addr), (size_t)alloc_size);
+    /* make the GC pacer see the adopted C memory (the debt resets at
+       the end of each cycle, so this only accelerates the next one) */
+    if (alloc_size > 0)
+      luaE_setdebt(G(L), G(L)->GCdebt + (l_mem)alloc_size);
   }
   return f;
 }
@@ -1812,6 +1923,8 @@ void luaA_retainstoredptr (lua_State *L, Foreign *f, const void **dest,
   if (val == NULL || f->addr != (void *)val) return;
   if (luaA_mapget(&as->roots, dest) != NULL)
     return;  /* the GC policy already manages this slot */
+  if (slot_is_lua_known(as, dest))
+    return;  /* internal edge: the GC traversal covers it */
   basef = cast(Foreign *, luaA_mapget(&as->basemap, val));
   if (basef == f)
     luaA_mapset(L, &as->roots, dest, f);

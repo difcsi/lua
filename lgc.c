@@ -770,8 +770,14 @@ static l_mem propagatemark (global_State *g) {
     case LUA_VPROTO: return traverseproto(g, gco2p(o));
     case LUA_VTHREAD: return traversethread(g, gco2th(o));
 #if defined(LUA_USE_LIBALLOCS)
-    case LUA_VFOREIGN: case LUA_VFFUNC:
-      return luaA_traverseforeign(g, gco2frn(o));
+    case LUA_VFOREIGN: case LUA_VFFUNC: {
+      Foreign *f = gco2frn(o);
+      /* the C memory can gain references behind the collector's back,
+         so foreigns are re-traversed atomically, like threads */
+      if (isold(f) || g->gcstate == GCSpropagate)
+        linkgclist(f, g->grayagain);
+      return luaA_traverseforeign(g, f);
+    }
 #endif
     default: lua_assert(0); return 0;
   }
@@ -1191,6 +1197,13 @@ static void sweep2old (lua_State *L, GCObject **p) {
         lua_State *th = gco2th(curr);
         linkgclist(th, g->grayagain);  /* insert into 'grayagain' list */
       }
+#if defined(LUA_USE_LIBALLOCS)
+      else if (novariant(curr->tt) == LUA_TFOREIGN) {
+        /* foreigns must be watched too (C memory mutates untracked) */
+        Foreign *f = gco2frn(curr);
+        linkgclist(f, g->grayagain);
+      }
+#endif
       else if (curr->tt == LUA_VUPVAL && upisopen(gco2upv(curr)))
         set2gray(curr);  /* open upvalues are always gray */
       else  /* everything else is black */
@@ -1283,6 +1296,12 @@ static GCObject **correctgraylist (GCObject **p) {
       lua_assert(isgray(curr));
       goto remain;  /* keep non-white threads on the list */
     }
+#if defined(LUA_USE_LIBALLOCS)
+    else if (novariant(curr->tt) == LUA_TFOREIGN) {
+      lua_assert(isgray(curr));
+      goto remain;  /* keep non-white foreigns on the list */
+    }
+#endif
     else {  /* everything else is removed */
       lua_assert(isold(curr));  /* young objects should be white here */
       if (getage(curr) == G_TOUCHED2)  /* advance from TOUCHED2... */
