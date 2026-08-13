@@ -20,6 +20,7 @@
 #endif
 
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -285,6 +286,198 @@ static int frnmethod_str (lua_State *L) {
   return 1;
 }
 
+/* push a derived view of the same address class, 'eoff' elements away,
+** anchored to its source allocation through the base GC edge */
+static void pushview (lua_State *L, Foreign *f, lua_Integer eoff,
+                      size_t len) {
+  ForeignTypeAddress *at = cast(ForeignTypeAddress *, frntype(f));
+  size_t esz = at->pointee
+      ? UNIQTYPE_SIZE_IN_BYTES(at->pointee->ft_type) : 0;
+  Foreign *v = luaA_newforeign(L, (char *)f->addr + eoff * (lua_Integer)esz,
+                               frntype(f), len, LUA_VFOREIGN);
+  if (v->base == NULL && v != f) {
+    v->base = (f->flags & FF_BASE) ? f : (f->base != NULL ? f->base : f);
+    luaC_objbarrier(L, v, v->base);
+  }
+  luaA_pushforeign(L, v);
+}
+
+/* the address/array-class foreign among the two operands of a binary
+** metamethod, with the other operand's index in *other */
+static Foreign *arithoperand (lua_State *L, int *other) {
+  Foreign *f = luaA_toforeign(L, 1);
+  if (f != NULL && frntype(f) != NULL
+      && (frntype(f)->ft_kind == ADDRESS || frntype(f)->ft_kind == ARRAY)) {
+    *other = 2;
+    return f;
+  }
+  f = luaA_toforeign(L, 2);
+  if (f != NULL && frntype(f) != NULL
+      && (frntype(f)->ft_kind == ADDRESS || frntype(f)->ft_kind == ARRAY)) {
+    *other = 1;
+    return f;
+  }
+  luaL_error(L, "no address-class foreign operand in pointer arithmetic");
+  return NULL;
+}
+
+static void checkarith (lua_State *L, Foreign *f) {
+  ForeignTypeAddress *at = cast(ForeignTypeAddress *, frntype(f));
+  if (f->flags & FF_RELEASED)
+    luaL_error(L, "access to a released foreign proxy");
+  if (at->pointee == NULL
+      || UNIQTYPE_SIZE_IN_BYTES(at->pointee->ft_type) == 0)
+    luaL_error(L, "pointer arithmetic needs a sized pointee type");
+}
+
+/* p + n / n + p: a view 'n' elements further along */
+static int frn_arith_add (lua_State *L) {
+  int other;
+  Foreign *f = arithoperand(L, &other);
+  lua_Integer n = luaL_checkinteger(L, other);
+  size_t len;
+  checkarith(L, f);
+  len = (n >= 0 && (size_t)n < f->length) ? f->length - (size_t)n
+      : (n < 0) ? f->length + (size_t)-n : 0;
+  pushview(L, f, n, len);
+  return 1;
+}
+
+/* p - q: element distance; p - n: a view 'n' elements back */
+static int frn_arith_sub (lua_State *L) {
+  Foreign *p = luaA_toforeign(L, 1);
+  Foreign *q = luaA_toforeign(L, 2);
+  if (p != NULL && q != NULL) {
+    ForeignTypeAddress *pat, *qat;
+    size_t esz;
+    if (frntype(p) == NULL || frntype(q) == NULL
+        || (frntype(p)->ft_kind != ADDRESS && frntype(p)->ft_kind != ARRAY)
+        || (frntype(q)->ft_kind != ADDRESS && frntype(q)->ft_kind != ARRAY))
+      return luaL_error(L, "pointer difference needs two address-class"
+                        " foreign values");
+    pat = cast(ForeignTypeAddress *, frntype(p));
+    qat = cast(ForeignTypeAddress *, frntype(q));
+    if (pat->pointee == NULL || pat->pointee != qat->pointee)
+      return luaL_error(L, "pointer difference over different element"
+                        " types");
+    esz = UNIQTYPE_SIZE_IN_BYTES(pat->pointee->ft_type);
+    if (esz == 0)
+      return luaL_error(L, "pointer arithmetic needs a sized pointee type");
+    lua_pushinteger(L, ((char *)p->addr - (char *)q->addr)
+                       / (lua_Integer)esz);
+    return 1;
+  }
+  if (p != NULL) {  /* p - n */
+    lua_Integer n = luaL_checkinteger(L, 2);
+    size_t len;
+    checkarith(L, p);
+    len = (n <= 0 && (size_t)-n <= SIZE_MAX - p->length)
+        ? p->length + (size_t)-n
+        : ((size_t)n < p->length ? p->length - (size_t)n : 0);
+    pushview(L, p, -n, len);
+    return 1;
+  }
+  return luaL_error(L, "invalid operands for foreign pointer arithmetic");
+}
+
+/* the allocation anchor used for ordered comparison */
+static Foreign *cmpanchor (Foreign *f) {
+  if (f->flags & FF_BASE) return f;
+  return f->base;
+}
+
+static void cmpoperands (lua_State *L, Foreign **p, Foreign **q) {
+  *p = luaA_toforeign(L, 1);
+  *q = luaA_toforeign(L, 2);
+  if (*p == NULL || *q == NULL)
+    luaL_error(L, "cannot order a foreign value against a %s",
+               luaL_typename(L, (*p == NULL) ? 1 : 2));
+  if (cmpanchor(*p) == NULL || cmpanchor(*p) != cmpanchor(*q))
+    luaL_error(L, "cannot order pointers into different allocations");
+}
+
+static int frn_arith_lt (lua_State *L) {
+  Foreign *p, *q;
+  cmpoperands(L, &p, &q);
+  lua_pushboolean(L, (char *)p->addr < (char *)q->addr);
+  return 1;
+}
+
+static int frn_arith_le (lua_State *L) {
+  Foreign *p, *q;
+  cmpoperands(L, &p, &q);
+  lua_pushboolean(L, (char *)p->addr <= (char *)q->addr);
+  return 1;
+}
+
+/*
+** pairs() over foreign values: structs yield (field name, value) in
+** declaration order (skipping fields of unhandled type); address and
+** array views yield (index, element) like ipairs.
+*/
+static int frn_next (lua_State *L) {
+  Foreign *f = checkforeign(L, 1);
+  ForeignType *ft = frntype(f);
+  if (f->flags & FF_RELEASED)
+    return luaL_error(L, "access to a released foreign proxy");
+  if (ft == NULL)
+    return luaL_error(L, "cannot iterate this foreign value");
+  switch (ft->ft_kind) {
+    case COMPOSITE: {
+      ForeignTypeComposite *ct = cast(ForeignTypeComposite *, ft);
+      unsigned i = 0;
+      if (!lua_isnoneornil(L, 2)) {  /* find the field after 'prev' */
+        const char *prev = luaL_checkstring(L, 2);
+        while (i < ct->nfields
+               && (ct->fields[i].name == NULL
+                   || strcmp(ct->fields[i].name, prev) != 0))
+          i++;
+        i++;  /* start after the previous field */
+      }
+      while (i < ct->nfields && ct->fields[i].type == NULL)
+        i++;  /* skip fields with unhandled types */
+      if (i >= ct->nfields) {
+        lua_pushnil(L);
+        return 1;
+      }
+      lua_pushstring(L, ct->fields[i].name);
+      if (luaA_pushfromdata(L, (char *)luaA_rawaddr(f)
+                               + ct->fields[i].offset,
+                            ct->fields[i].type, 0))
+        return lua_error(L);
+      return 2;
+    }
+    case ADDRESS: case ARRAY: {
+      ForeignTypeAddress *at = cast(ForeignTypeAddress *, ft);
+      lua_Integer i = luaL_optinteger(L, 2, 0) + 1;
+      size_t esz;
+      if (at->pointee == NULL)
+        return luaL_error(L, "pointee foreign datatype is not handled");
+      if (i < 1 || (size_t)i > f->length) {
+        lua_pushnil(L);
+        return 1;
+      }
+      esz = UNIQTYPE_SIZE_IN_BYTES(at->pointee->ft_type);
+      lua_pushinteger(L, i);
+      if (luaA_pushfromdata(L, (char *)luaA_rawaddr(f)
+                               + (size_t)(i - 1) * esz,
+                            at->pointee, 0))
+        return lua_error(L);
+      return 2;
+    }
+    default:
+      return luaL_error(L, "cannot iterate this foreign value");
+  }
+}
+
+static int frn_pairs (lua_State *L) {
+  checkforeign(L, 1);
+  lua_pushcfunction(L, frn_next);
+  lua_pushvalue(L, 1);
+  lua_pushnil(L);
+  return 3;
+}
+
 /*
 ** __index fallback: the native path (luaA_foreignget) answered
 ** LUAA_NOTFOUND. Serve methods, then raise the parity error messages.
@@ -470,13 +663,23 @@ static int frn_tostring (lua_State *L) {
 
 /* install the shared metatable for all foreign values */
 static void installforeignmt (lua_State *L) {
-  lua_createtable(L, 0, 4);
+  lua_createtable(L, 0, 8);
   lua_pushcfunction(L, frn_index);
   lua_setfield(L, -2, "__index");
   lua_pushcfunction(L, frn_newindex);
   lua_setfield(L, -2, "__newindex");
   lua_pushcfunction(L, frn_tostring);
   lua_setfield(L, -2, "__tostring");
+  lua_pushcfunction(L, frn_pairs);
+  lua_setfield(L, -2, "__pairs");
+  lua_pushcfunction(L, frn_arith_add);
+  lua_setfield(L, -2, "__add");
+  lua_pushcfunction(L, frn_arith_sub);
+  lua_setfield(L, -2, "__sub");
+  lua_pushcfunction(L, frn_arith_lt);
+  lua_setfield(L, -2, "__lt");
+  lua_pushcfunction(L, frn_arith_le);
+  lua_setfield(L, -2, "__le");
   G(L)->mt[LUA_TFOREIGN] = hvalue(s2v(L->top.p - 1));
   lua_pop(L, 1);
 }

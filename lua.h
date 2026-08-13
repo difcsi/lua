@@ -212,6 +212,12 @@ LUA_API void	       *(lua_touserdata) (lua_State *L, int idx);
 LUA_API lua_State      *(lua_tothread) (lua_State *L, int idx);
 LUA_API const void     *(lua_topointer) (lua_State *L, int idx);
 
+#if defined(LUA_USE_LIBALLOCS)
+LUA_API int		(lua_isforeign) (lua_State *L, int idx);
+LUA_API void	       *(lua_toforeignaddr) (lua_State *L, int idx);
+LUA_API int		(lua_pushforeign) (lua_State *L, void *addr);
+#endif
+
 
 /*
 ** Comparison and arithmetic functions

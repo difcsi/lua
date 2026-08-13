@@ -30,6 +30,10 @@
 #include "lundump.h"
 #include "lvm.h"
 
+#if defined(LUA_USE_LIBALLOCS)
+#include "lallocs.h"
+#endif
+
 
 
 const char lua_ident[] =
@@ -447,6 +451,10 @@ LUA_API lua_Unsigned lua_rawlen (lua_State *L, int idx) {
       lua_unlock(L);
       return res;
     }
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFOREIGN: case LUA_VFFUNC:
+      return cast(lua_Unsigned, frnvalue(o)->length);
+#endif
     default: return 0;
   }
 }
@@ -495,6 +503,10 @@ LUA_API const void *lua_topointer (lua_State *L, int idx) {
     case LUA_VLCF: return cast_voidp(cast_sizet(fvalue(o)));
     case LUA_VUSERDATA: case LUA_VLIGHTUSERDATA:
       return touserdata(o);
+#if defined(LUA_USE_LIBALLOCS)
+    case LUA_VFOREIGN: case LUA_VFFUNC:
+      return frnvalue(o)->addr;
+#endif
     default: {
       if (iscollectable(o))
         return gcvalue(o);
@@ -503,6 +515,39 @@ LUA_API const void *lua_topointer (lua_State *L, int idx) {
     }
   }
 }
+
+
+#if defined(LUA_USE_LIBALLOCS)
+
+LUA_API int lua_isforeign (lua_State *L, int idx) {
+  const TValue *o = index2value(L, idx);
+  return ttisforeign(o);
+}
+
+LUA_API void *lua_toforeignaddr (lua_State *L, int idx) {
+  const TValue *o = index2value(L, idx);
+  return ttisforeign(o) ? frnvalue(o)->addr : NULL;
+}
+
+/*
+** Push the base foreign value for the allocation containing 'addr'
+** (creating it if liballocs can type the allocation); pushes nil and
+** returns 0 when no foreign view can exist for it.
+*/
+LUA_API int lua_pushforeign (lua_State *L, void *addr) {
+  Foreign *f;
+  lua_lock(L);
+  f = luaA_getorcreatebase(L, addr);
+  if (f != NULL)
+    { setfrnvalue2s(L, L->top.p, f); }
+  else
+    { setnilvalue(s2v(L->top.p)); }
+  api_incr_top(L);
+  lua_unlock(L);
+  return f != NULL;
+}
+
+#endif
 
 
 
